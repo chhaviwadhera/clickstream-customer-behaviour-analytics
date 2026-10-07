@@ -1,0 +1,6 @@
+Copyright (c) 2026 Chhavi Wadhera
+
+This repository is published for portfolio and educational purposes.
+The original project materials and source data may be subject to the terms of the
+course, dataset provider, or other third parties. Please do not redistribute
+source datasets unless you have the right to do so.

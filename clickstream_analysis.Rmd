@@ -1,0 +1,708 @@
+---
+title: "Clickstream Customer Behaviour Analysis"
+author: "Chhavi Wadhera"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    theme: cosmo
+params:
+  data_dir: "data"
+  run_analysis: false
+---
+
+# Project Overview
+
+This project analyses e-commerce clickstream data to understand **customer behaviour, review influence, purchase activity and customer journeys**.
+
+The analysis combines:
+
+- clickstream feed data;
+- product and review metadata; and
+- registered-user information.
+
+
+> **Reproducibility note:** Set `params$run_analysis` to `TRUE` and place the three source files in the directory specified by `params$data_dir` to execute the analysis. The default is `FALSE` so the document can be reviewed as a portfolio/code artifact without requiring the original dataset.
+
+# 1. Analytical Objectives
+
+The project addresses two primary business questions:
+
+1. **Review influence:** How do customer reviews, video reviews and celebrity recommendations compare in their relationship with purchasing activity?
+2. **Customer journey:** How do users navigate the website, which pages receive the most traffic, and how do browsing patterns differ between buyers and non-buyers?
+
+The analysis uses data preparation, statistical testing, regression, page-frequency analysis and sequence modelling.
+
+# 2. Setup
+
+The project uses `dplyr` and `tidyr` for data preparation, `TraMineR` for sequence analysis and `clickstream` for Markov-chain modelling.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+
+library(dplyr)
+library(tidyr)
+library(TraMineR)
+library(clickstream)
+```
+
+```{r packages, eval=FALSE}
+# Install once if required:
+# install.packages(c(
+#   "dplyr", "tidyr", "TraMineR", "clickstream"
+# ))
+
+library(dplyr)
+library(tidyr)
+library(TraMineR)
+library(clickstream)
+```
+
+# 3. Data Import
+
+Expected project structure:
+
+```text
+clickstream-project/
+├── clickstream_analysis.Rmd
+└── data/
+    ├── clickstream-feed-generated.tsv
+    ├── products (2).tsv
+    └── regusers (1).tsv
+```
+
+```{r import-data, eval=params$run_analysis}
+data_dir <- params$data_dir
+
+clickstream <- read.delim(
+  file.path(data_dir, "clickstream-feed-generated.tsv"),
+  sep = "\t",
+  stringsAsFactors = FALSE
+)
+
+products <- read.delim(
+  file.path(data_dir, "products (2).tsv"),
+  sep = "\t",
+  stringsAsFactors = FALSE
+)
+
+regusers <- read.delim(
+  file.path(data_dir, "regusers (1).tsv"),
+  sep = "\t",
+  stringsAsFactors = FALSE
+)
+
+# Standardise the user/session identifier before joining datasets.
+names(regusers)[1] <- "user_session_id"
+
+dim(clickstream)
+dim(products)
+dim(regusers)
+```
+
+# 4. Data Preparation
+
+## 4.1 Classifying Website Pages
+
+The raw clickstream contains review/page identifiers. These are mapped into business-facing categories so that customer-review, video-review, celebrity-recommendation, product and homepage interactions can be analysed consistently.
+
+```{r classify-pages, eval=params$run_analysis}
+clickstream <- clickstream %>%
+  mutate(
+    category = case_when(
+      review_id == 1000 ~ "home page",
+      review_id %in% c(1001, 1002, 1003) ~ "video review",
+      review_id %in% c(2001, 2002) ~ "celebrity recommendation",
+      review_id %in% c(3001, 3002, 3003, 3004, 3005) ~ "customer review",
+      review_id %in% c(4001, 4002, 4003, 4004, 4005) ~ "product",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+## 4.2 Joining User Information
+
+Registered-user attributes are joined to clickstream records using the user/session identifier.
+
+```{r merge-data, eval=params$run_analysis}
+merged_data <- clickstream %>%
+  left_join(regusers, by = "user_session_id")
+
+glimpse(merged_data)
+```
+
+## 4.3 Basic Data Quality Checks
+
+```{r data-quality, eval=params$run_analysis}
+data_quality <- tibble(
+  metric = c(
+    "Rows",
+    "Unique users",
+    "Unique URLs",
+    "Unique clickstream IDs",
+    "Missing user IDs",
+    "Missing timestamps"
+  ),
+  value = c(
+    nrow(merged_data),
+    n_distinct(merged_data$user_session_id),
+    n_distinct(merged_data$url),
+    n_distinct(merged_data$clickstream_id),
+    sum(is.na(merged_data$user_session_id)),
+    sum(is.na(merged_data$timestamp))
+  )
+)
+
+data_quality
+```
+
+# 5. Descriptive Customer Behaviour
+
+## 5.1 Buyer Population
+
+A buyer is defined as a user/session with `is_purchased.` equal to 1.
+
+```{r buyers, eval=params$run_analysis}
+buyer_summary <- merged_data %>%
+  group_by(user_session_id) %>%
+  summarise(
+    purchased = as.integer(any(is_purchased. == 1, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  summarise(
+    unique_users = n(),
+    buyers = sum(purchased),
+    buyer_rate = mean(purchased)
+  )
+
+buyer_summary
+```
+
+## 5.2 Average Number of Pages Visited
+
+The analysis compared browsing depth for buyers and non-buyers. The calculation is performed at user level so that users with many clickstream records do not receive disproportionate weight.
+
+```{r browsing-depth, eval=params$run_analysis}
+user_browsing <- merged_data %>%
+  group_by(user_session_id) %>%
+  summarise(
+    purchased = as.integer(any(is_purchased. == 1, na.rm = TRUE)),
+    gender = first(na.omit(GENDER_CD)),
+    pages_visited = n_distinct(url),
+    .groups = "drop"
+  )
+
+buyer_vs_nonbuyer <- user_browsing %>%
+  group_by(segment = if_else(purchased == 1, "Buyer", "Non-buyer")) %>%
+  summarise(
+    users = n(),
+    average_pages_visited = mean(pages_visited, na.rm = TRUE),
+    median_pages_visited = median(pages_visited, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+buyer_vs_nonbuyer
+```
+
+## 5.3 Browsing by Gender
+
+```{r gender-browsing, eval=params$run_analysis}
+gender_browsing <- user_browsing %>%
+  filter(gender %in% c("M", "F")) %>%
+  group_by(gender) %>%
+  summarise(
+    users = n(),
+    average_pages_visited = mean(pages_visited, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+gender_browsing
+```
+
+# 6. Review Exposure Analysis
+
+## 6.1 Session-Level Distribution of Review Types
+
+```{r review-distribution, eval=params$run_analysis}
+review_distribution <- merged_data %>%
+  filter(category %in% c(
+    "customer review",
+    "video review",
+    "celebrity recommendation"
+  )) %>%
+  count(category, name = "sessions") %>%
+  arrange(desc(sessions))
+
+review_distribution
+```
+
+The analysis found approximately **68,074 customer-review sessions, 41,974 video-review sessions and 27,592 celebrity-recommendation sessions**.
+
+## 6.2 User-Level Review Exposure
+
+For modelling, review exposure is aggregated to the user/session level.
+
+```{r review-exposure, eval=params$run_analysis}
+review_exposure <- merged_data %>%
+  group_by(user_session_id) %>%
+  summarise(
+    customer_review = sum(category == "customer review", na.rm = TRUE),
+    video_review = sum(category == "video review", na.rm = TRUE),
+    celebrity_recommendation = sum(
+      category == "celebrity recommendation",
+      na.rm = TRUE
+    ),
+    total_purchases = sum(is_purchased., na.rm = TRUE),
+    purchased = as.integer(any(is_purchased. == 1, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+review_exposure <- review_exposure %>%
+  mutate(
+    customer_review_exposed = as.integer(customer_review > 0),
+    video_review_exposed = as.integer(video_review > 0),
+    celebrity_review_exposed = as.integer(
+      celebrity_recommendation > 0
+    )
+  )
+
+head(review_exposure)
+```
+
+# 7. Hypothesis Testing
+
+The presentation used right-tailed tests of differences in conversion proportions.
+
+The main hypothesis is:
+
+- **H0:** Celebrity reviews do not have a higher conversion rate than customer reviews.
+- **H1:** Celebrity reviews have a higher conversion rate than customer reviews.
+
+The same framework can be used for the other pairwise comparisons.
+
+```{r hypothesis-test-function, eval=params$run_analysis}
+conversion_test <- function(data, exposure_a, exposure_b) {
+
+  a <- data %>%
+    filter(.data[[exposure_a]] == 1) %>%
+    summarise(
+      conversions = sum(purchased),
+      users = n()
+    )
+
+  b <- data %>%
+    filter(.data[[exposure_b]] == 1) %>%
+    summarise(
+      conversions = sum(purchased),
+      users = n()
+    )
+
+  prop.test(
+    x = c(a$conversions, b$conversions),
+    n = c(a$users, b$users),
+    alternative = "greater",
+    correct = FALSE
+  )
+}
+
+celebrity_vs_customer <- conversion_test(
+  review_exposure,
+  "celebrity_review_exposed",
+  "customer_review_exposed"
+)
+
+celebrity_vs_customer
+```
+
+The project reported a z-score of **-145.03** and a right-tailed p-value approximately equal to 1 for the celebrity-versus-customer comparison, leading to failure to reject the null hypothesis.
+
+> **Interpretation:** the result does not support the claim that celebrity reviews are more influential than customer reviews. It should be interpreted as an association in the observed clickstream sample rather than causal evidence.
+
+## 7.1 Customer Reviews versus Video Reviews
+
+```{r customer-vs-video, eval=params$run_analysis}
+customer_vs_video <- conversion_test(
+  review_exposure,
+  "customer_review_exposed",
+  "video_review_exposed"
+)
+
+customer_vs_video
+```
+
+The project reported a z-score of **88.71** and p-value below 0.05 for the customer-review versus video-review comparison.
+
+## 7.2 Celebrity Reviews versus Video Reviews
+
+```{r celebrity-vs-video, eval=params$run_analysis}
+celebrity_vs_video <- conversion_test(
+  review_exposure,
+  "celebrity_review_exposed",
+  "video_review_exposed"
+)
+
+celebrity_vs_video
+```
+
+The project reported a z-score of **-58.63** and a right-tailed p-value approximately equal to 1.
+
+# 8. Purchase Activity Modelling
+
+The project modelled user-level total purchase activity against review exposure.
+
+The specification was:
+
+\[
+TotalPurchases =
+\beta_0 +
+\beta_1(CustomerReview) +
+\beta_2(VideoReview \times CelebrityRecommendation)
++ \epsilon
+\]
+
+```{r purchase-model, eval=params$run_analysis}
+purchase_model <- lm(
+  total_purchases ~
+    customer_review +
+    video_review:celebrity_recommendation,
+  data = review_exposure
+)
+
+summary(purchase_model)
+```
+
+A simpler model was also estimated.
+
+```{r simple-purchase-model, eval=params$run_analysis}
+purchase_model_simple <- lm(
+  total_purchases ~ customer_review,
+  data = review_exposure
+)
+
+summary(purchase_model_simple)
+```
+
+The presentation reported coefficients of **0.1814 for customer-review exposure** and **0.003761 for the combined video/celebrity term**.
+
+> **Technical note:** This is an observational linear model for a purchase-count outcome. It is useful for exploratory analysis, but it should not be presented as a causal model. 
+
+# 9. Customer Journey Analysis
+
+## 9.1 Ordering the Clickstream
+
+Customer journeys must be reconstructed in temporal order.
+
+```{r order-clickstream, eval=params$run_analysis}
+merged_data <- merged_data %>%
+  arrange(user_session_id, timestamp)
+```
+
+## 9.2 Most Visited Pages
+
+```{r page-frequency, eval=params$run_analysis}
+page_counts <- merged_data %>%
+  count(url, sort = TRUE)
+
+head(page_counts, 10)
+```
+
+```{r top-pages-plot, eval=params$run_analysis, fig.cap="Top website pages by clickstream frequency."}
+top_pages <- page_counts %>%
+  slice_head(n = 10)
+
+barplot(
+  top_pages$n,
+  names.arg = top_pages$url,
+  las = 2,
+  cex.names = 0.7,
+  main = "Top 10 Most Visited Pages",
+  ylab = "Number of Clickstream Records"
+)
+```
+
+The presentation identified the homepage and several product pages among the most frequently visited locations, with products 3, 1 and 5 highlighted as particularly popular.
+
+# 10. Reconstructing Individual Customer Paths
+
+A reproducible random sample is used to illustrate individual customer journeys.
+
+```{r sample-paths, eval=params$run_analysis}
+set.seed(123)
+
+random_user_ids <- sample(
+  unique(merged_data$user_session_id),
+  size = 5
+)
+
+sampled_journeys <- merged_data %>%
+  filter(user_session_id %in% random_user_ids) %>%
+  arrange(user_session_id, timestamp)
+
+sampled_journeys
+```
+
+```{r sequence-paths, eval=params$run_analysis}
+sequence_data <- sampled_journeys %>%
+  group_by(user_session_id) %>%
+  summarise(
+    page_sequence = paste(url, collapse = " > "),
+    exit_page = last(url),
+    .groups = "drop"
+  )
+
+sequence_data
+```
+
+
+# 11. Sequence Analysis with TraMineR
+
+
+```{r create-sequences, eval=params$run_analysis}
+user_paths <- merged_data %>%
+  group_by(user_session_id) %>%
+  arrange(timestamp, .by_group = TRUE) %>%
+  summarise(
+    path = list(url),
+    .groups = "drop"
+  )
+
+max_path_length <- max(lengths(user_paths$path))
+
+sequence_matrix <- do.call(
+  rbind,
+  lapply(
+    user_paths$path,
+    function(x) {
+      c(
+        x,
+        rep(NA_character_, max_path_length - length(x))
+      )
+    }
+  )
+)
+
+sequence_matrix <- as.data.frame(sequence_matrix)
+names(sequence_matrix) <- paste0(
+  "step_",
+  seq_len(ncol(sequence_matrix))
+)
+
+clickstream_seq <- seqdef(
+  sequence_matrix,
+  right = "DEL"
+)
+
+clickstream_seq
+```
+
+## 11.1 Sequence Frequencies
+
+```{r sequence-frequency, eval=params$run_analysis}
+sequence_frequencies <- seqtab(clickstream_seq)
+
+sequence_frequencies <- sort(
+  sequence_frequencies,
+  decreasing = TRUE
+)
+
+head(sequence_frequencies, 10)
+```
+
+```{r sequence-frequency-plot, eval=params$run_analysis}
+seqfplot(
+  clickstream_seq,
+  with.legend = FALSE
+)
+```
+
+# 12. Markov-Chain Modelling
+
+The project uses the `clickstream` package to model page-to-page transitions. The package supports zero-, first- and higher-order Markov chains; a second-order model conditions transitions on a longer recent browsing history. citeturn1search0
+
+Instead of relying on an external `output.csv` generated manually, the clickstream sequences are converted into the format expected by `readClickstreams()`.
+
+```{r markov-data, eval=params$run_analysis}
+markov_lines <- user_paths %>%
+  mutate(
+    clickstream = paste(
+      user_session_id,
+      paste(path, collapse = ","),
+      sep = ","
+    )
+  ) %>%
+  pull(clickstream)
+
+markov_file <- tempfile(fileext = ".csv")
+
+writeLines(
+  c(
+    "user_session_id",
+    markov_lines
+  ),
+  markov_file
+)
+
+cls <- readClickstreams(
+  markov_file,
+  header = TRUE
+)
+
+summary(cls)
+```
+
+```{r markov-model, eval=params$run_analysis}
+markov_model <- fitMarkovChain(
+  clickstreamList = cls,
+  order = 2,
+  control = list(optimizer = "quadratic")
+)
+
+summary(markov_model)
+```
+
+The resulting Markov chain can be used to study likely next-page transitions and, in a production setting, to support journey prediction or next-best-action analysis. The `clickstream` package documentation confirms that higher-order Markov chains are supported and that `fitMarkovChain()` returns a MarkovChain object. citeturn1search2turn1search3
+
+# 13. Sequence Distance and Clustering
+
+The notebook conducted hierarchical clustering by calculating sequence distances with `TraMineR`.
+
+```{r sequence-distance, eval=params$run_analysis}
+# Pairwise sequence distances can be expensive on the full population.
+# Use a reproducible sample for exploratory clustering.
+set.seed(123)
+cluster_ids <- sample(
+  seq_len(nrow(clickstream_seq)),
+  size = min(1000, nrow(clickstream_seq))
+)
+
+cluster_seq <- clickstream_seq[cluster_ids, ]
+
+clickstream_dist <- seqdist(
+  cluster_seq,
+  method = "OM"
+)
+
+clickstream_hclust <- hclust(
+  as.dist(clickstream_dist),
+  method = "ward.D2"
+)
+
+plot(
+  clickstream_hclust,
+  main = "Hierarchical Clustering of Customer Journeys",
+  xlab = "",
+  sub = ""
+)
+```
+
+
+# 14. Sequence-Level Purchase Association
+
+A simple sequence feature is the total number of observed steps in a customer's journey:
+
+```{r sequence-features, eval=params$run_analysis}
+sequence_features <- user_paths %>%
+  mutate(
+    journey_length = lengths(path)
+  ) %>%
+  select(
+    user_session_id,
+    journey_length
+  )
+
+sequence_features <- sequence_features %>%
+  left_join(
+    review_exposure %>%
+      select(user_session_id, purchased),
+    by = "user_session_id"
+  )
+
+head(sequence_features)
+```
+
+A purchase-propensity model can then be developed at user level:
+
+```{r propensity-model, eval=params$run_analysis}
+propensity_model <- glm(
+  purchased ~ journey_length,
+  data = sequence_features,
+  family = binomial()
+)
+
+summary(propensity_model)
+```
+
+
+# 15. Additional Journey Metrics
+
+## 15.1 Time Between Consecutive Page Visits
+
+Page duration is calculated **within each user journey**.
+
+```{r dwell-time, eval=params$run_analysis}
+merged_data <- merged_data %>%
+  arrange(user_session_id, timestamp) %>%
+  group_by(user_session_id) %>%
+  mutate(
+    next_timestamp = lead(timestamp),
+    dwell_seconds = as.numeric(
+      difftime(
+        next_timestamp,
+        timestamp,
+        units = "secs"
+      )
+    )
+  ) %>%
+  ungroup()
+
+head(
+  merged_data %>%
+    select(
+      user_session_id,
+      url,
+      timestamp,
+      next_timestamp,
+      dwell_seconds
+    )
+)
+```
+
+This produces a more defensible approximation of time spent before the next recorded interaction. The final observation in each journey has no subsequent timestamp and is therefore left as `NA`.
+
+# 16. Business Interpretation
+
+The analysis indicates three important behavioural patterns:
+
+1. **Customer reviews have the highest visibility** among the three review formats.
+2. **Customer reviews show a stronger observed relationship with purchasing activity** than the other review formats examined.
+3. **Buyers follow substantially shorter browsing journeys than non-buyers**, suggesting a meaningful difference in navigation behaviour.
+
+These findings support practical opportunities in review placement, website navigation, content sequencing and conversion optimisation.
+
+The results should, however, be treated as **observational evidence rather than causal estimates**. In particular, users who purchase may already have stronger purchase intent, which could itself explain shorter journeys.
+
+# 17. Recommendations
+
+- Prioritise high-quality customer-generated reviews on relevant product pages.
+- Test the placement and presentation of video and celebrity content rather than assuming that more exposure will increase conversion.
+- Reduce unnecessary navigation between product discovery, evaluation and purchase.
+- Monitor common customer paths and exit points using sequence analysis.
+- Use controlled A/B tests to evaluate review placement, calls to action and product-page design.
+- Extend the analysis into customer-level purchase propensity modelling using behavioural features such as page depth, review exposure, product interactions and journey sequence.
+- Segment customers by behavioural journey rather than relying exclusively on demographic characteristics.
+
+# 18. References
+
+- TraMineR documentation: sequence objects and sequence analysis. <https://cran.r-project.org/package=TraMineR>
+- `clickstream` R package documentation: Markov-chain modelling of clickstream sequences. <https://cran.r-project.org/package=clickstream>
+- R Markdown documentation: executable R code chunks and `knitr`. <https://rmarkdown.rstudio.com/>
+
